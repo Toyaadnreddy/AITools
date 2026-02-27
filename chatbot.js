@@ -1,7 +1,17 @@
-// ─── GROQ AI CHATBOT FOR AI TOOLS HUB ──────────────────────────────────────
-const GROQ_API_KEY = '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';
-const GROQ_MODEL = 'llama-3.3-70b-versatile';
-const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
+// ─── OPENROUTER AI CHATBOT FOR AI TOOLS HUB ─────────────────────────────────
+// 5-model fallback chain: tries each free model in order until one responds
+const OR_API_KEY = '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';
+const OR_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
+
+// Free models tried in order — if one fails, next is attempted automatically
+const OR_MODELS = [
+  'mistralai/mistral-7b-instruct:free',       // 1st: fast, accurate
+  'meta-llama/llama-3.2-3b-instruct:free',    // 2nd: Meta Llama, reliable
+  'google/gemma-3-1b-it:free',                // 3rd: Google Gemma
+  'qwen/qwen-2-7b-instruct:free',             // 4th: Qwen 7B
+  'microsoft/phi-3-mini-128k-instruct:free',  // 5th: Microsoft Phi-3
+];
+
 
 // Chat state
 let chatHistory = [];
@@ -68,7 +78,7 @@ function injectChatbot() {
           </svg>
         </button>
       </div>
-      <div class="cb-powered">Powered by <b>Groq</b> · Llama 3.3 70B</div>
+      <div class="cb-powered">Powered by <b>OpenRouter</b> · Mistral 7B</div>
     </div>
   </div>`;
 
@@ -137,77 +147,164 @@ async function sendMessage() {
   addUserMessage(userMsg);
 
   chatHistory.push({ role: 'user', content: userMsg });
-  await getGroqResponse();
+  await getAIResponse();
 }
 
-// ─── GROQ API CALL ────────────────────────────────────────────────────────────
-async function getGroqResponse() {
+// ─── OPENROUTER API: MULTI-MODEL WATERFALL ───────────────────────────────────
+// Tries each model in OR_MODELS in order. If all fail → local smart fallback.
+async function getAIResponse(modelIndex = 0) {
   isTyping = true;
   const typingId = showTyping();
 
-  // Build messages array: system + history (last 10 messages for context window control)
   const messages = [
     { role: 'system', content: CHATBOT_SYSTEM_PROMPT },
     ...chatHistory.slice(-10)
   ];
 
-  try {
-    const resp = await fetch(GROQ_API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${GROQ_API_KEY}`
-      },
-      body: JSON.stringify({
-        model: GROQ_MODEL,
-        messages,
-        temperature: 0.65,
-        max_tokens: 1024,
-        stream: true
-      })
-    });
+  // Try current model
+  if (modelIndex < OR_MODELS.length) {
+    const model = OR_MODELS[modelIndex];
+    try {
+      const resp = await fetch(OR_API_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${OR_API_KEY}`,
+          'HTTP-Referer': window.location.href,
+          'X-Title': 'AI Tools Hub - NIST University'
+        },
+        body: JSON.stringify({
+          model,
+          messages,
+          temperature: 0.65,
+          max_tokens: 1024,
+          stream: true
+        })
+      });
 
-    if (!resp.ok) {
-      const err = await resp.json();
-      throw new Error(err.error?.message || `HTTP ${resp.status}`);
-    }
-
-    // ── Streaming response ────────────────────────────────────────────────────
-    removeTyping(typingId);
-    const msgId = addBotMessage('', true); // empty, will fill streaming
-    let fullText = '';
-
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      const chunk = decoder.decode(value, { stream: true });
-      const lines = chunk.split('\n').filter(l => l.startsWith('data: '));
-      for (const line of lines) {
-        const data = line.slice(6).trim();
-        if (data === '[DONE]') break;
-        try {
-          const parsed = JSON.parse(data);
-          const delta = parsed.choices?.[0]?.delta?.content || '';
-          if (delta) {
-            fullText += delta;
-            updateBotMessage(msgId, fullText);
-          }
-        } catch (_) { }
+      if (!resp.ok) {
+        // This model failed — silently try next one
+        removeTyping(typingId);
+        isTyping = false;
+        console.warn(`Model ${model} failed (HTTP ${resp.status}), trying next...`);
+        return getAIResponse(modelIndex + 1);
       }
+
+      // ── Streaming response ──────────────────────────────────────────────────
+      removeTyping(typingId);
+      const msgId = addBotMessage('', true);
+      let fullText = '';
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value, { stream: true });
+        const lines = chunk.split('\n').filter(l => l.startsWith('data: '));
+        for (const line of lines) {
+          const data = line.slice(6).trim();
+          if (data === '[DONE]') break;
+          try {
+            const parsed = JSON.parse(data);
+            const delta = parsed.choices?.[0]?.delta?.content || '';
+            if (delta) { fullText += delta; updateBotMessage(msgId, fullText); }
+          } catch (_) { }
+        }
+      }
+
+      // If model returned empty body, try next
+      if (!fullText.trim()) {
+        console.warn(`Model ${model} returned empty response, trying next...`);
+        isTyping = false;
+        return getAIResponse(modelIndex + 1);
+      }
+
+      chatHistory.push({ role: 'assistant', content: fullText });
+      scrollToBottom();
+
+    } catch (err) {
+      // Network error — try next model
+      removeTyping(typingId);
+      isTyping = false;
+      console.warn(`Model ${model} network error: ${err.message}, trying next...`);
+      return getAIResponse(modelIndex + 1);
+    } finally {
+      isTyping = false;
     }
 
-    chatHistory.push({ role: 'assistant', content: fullText });
-    scrollToBottom();
-  } catch (err) {
+  } else {
+    // ── ALL MODELS FAILED: Smart local fallback ─────────────────────────────
     removeTyping(typingId);
-    addBotMessage(`⚠️ **Connection error:** ${err.message}\n\nPlease try again.`, false);
-  } finally {
     isTyping = false;
+    const localResponse = localToolSearch(chatHistory[chatHistory.length - 1]?.content || '');
+    addBotMessage(localResponse, false);
+    chatHistory.push({ role: 'assistant', content: localResponse });
+    scrollToBottom();
   }
 }
+
+// ─── LOCAL SMART FALLBACK ─────────────────────────────────────────────────────
+// When all APIs are down, search the tool database locally by keyword matching
+function localToolSearch(query) {
+  const q = query.toLowerCase();
+
+  // Category keyword map
+  const catMap = {
+    'code|coding|developer|programming|github|debug|ide': 'CODE',
+    'image|photo|picture|design|art|draw|generate image': 'IMAGE',
+    'video|movie|film|animation|clip|reel|youtube': 'VIDEO',
+    'write|writing|essay|grammar|blog|content|article': 'WRITING',
+    'research|paper|academic|scholar|citation|study|thesis': 'RESEARCH',
+    'data|chart|graph|spreadsheet|excel|csv|analytics': 'DATA',
+    'presentation|slide|deck|ppt|powerpoint': 'PRESENTATION',
+    'productivity|task|meeting|schedule|note|organize': 'PRODUCTIVITY',
+    'chat|chatbot|assistant|gpt|ai chat|conversation': 'CHATBOT',
+    'design|ui|ux|logo|figma|canva|wireframe': 'DESIGN'
+  };
+
+  // Find matched category
+  let matchedCat = null;
+  for (const [pattern, cat] of Object.entries(catMap)) {
+    if (new RegExp(pattern).test(q)) { matchedCat = cat; break; }
+  }
+
+  // Extract tool blocks from system prompt
+  const toolBlocks = CHATBOT_SYSTEM_PROMPT.split('TOOL:').slice(1);
+  const matchedTools = [];
+
+  for (const block of toolBlocks) {
+    const lines = block.trim().split('\n');
+    const name = lines[0]?.trim() || '';
+    const catLine = lines.find(l => l.includes('CATEGORY:')) || '';
+    const urlLine = lines.find(l => l.includes('URL:')) || '';
+    const descLine = lines.find(l => l.includes('DESCRIPTION:')) || '';
+    const cat = catLine.replace('CATEGORY:', '').trim().toUpperCase();
+    const url = urlLine.replace('URL:', '').trim();
+    const desc = descLine.replace('DESCRIPTION:', '').trim().substring(0, 100) + '...';
+
+    const nameMatch = name && q.includes(name.toLowerCase().substring(0, 5));
+    const catMatch = matchedCat && cat.includes(matchedCat);
+
+    if (nameMatch || catMatch) {
+      matchedTools.push({ name, url, desc, cat });
+      if (matchedTools.length >= 6) break;
+    }
+  }
+
+  if (matchedTools.length > 0) {
+    const label = matchedCat ? `**${matchedCat.charAt(0) + matchedCat.slice(1).toLowerCase()} AI Tools**` : '**Matching AI Tools**';
+    const list = matchedTools.map(t =>
+      `▸ **[${t.name}](${t.url !== '#' ? t.url : '#'})** — ${t.desc}`
+    ).join('\n');
+    return `📡 *AI service temporarily busy — showing results from local database:*\n\n${label}\n\n${list}\n\n💡 Try refreshing the page for full AI responses.`;
+  }
+
+  // Generic helpful fallback
+  return `📡 *AI service is temporarily unavailable.*\n\nIn the meantime, here are some top tools by category:\n\n🤖 **Chatbots** — ChatGPT, Claude, Gemini, Grok\n💻 **Coding** — Cursor AI, GitHub Copilot, Bolt.new\n🔬 **Research** — NotebookLM, Consensus AI, Elicit\n🎨 **Image** — Midjourney, Leonardo AI, Adobe Firefly\n🎬 **Video** — Runway AI, Sora, CapCut\n✍️ **Writing** — Grammarly, Jasper, QuillBot\n\nPlease try again in a moment for full AI-powered recommendations! 🚀`;
+}
+
 
 // ─── MESSAGE RENDERING ────────────────────────────────────────────────────────
 function addUserMessage(text) {
